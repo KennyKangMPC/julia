@@ -2055,38 +2055,45 @@ stack: {
     }
 
 excstack: {
-        // Scan an exception stack
+        // Scan an exception stack buffer
         gc_mark_excstack_t *stackitr = gc_pop_markdata(&sp, gc_mark_excstack_t);
         jl_excstack_t *excstack = stackitr->s;
         size_t itr = stackitr->itr;
-        size_t i = stackitr->i;
+        size_t bt_index = stackitr->bt_index;
+        size_t gcval_index = stackitr->gcval_index;
         while (itr > 0) {
             size_t bt_size = jl_excstack_bt_size(excstack, itr);
-            uintptr_t *bt_data = jl_excstack_bt_data(excstack, itr);
-            while (i+2 < bt_size) {
-                if (bt_data[i] != JL_BT_INTERP_FRAME) {
-                    i++;
+            jl_bt_element_t *bt_data = jl_excstack_bt_data(excstack, itr);
+            for (; bt_index < bt_size; bt_index += JL_BT_ENTRY_SIZE(bt_data[bt_index])) {
+                jl_bt_element_t frameheader = bt_data[bt_index];
+                if (JL_BT_IS_NATIVE(frameheader))
                     continue;
-                }
-                // found an interpreter frame to mark
-                new_obj = (jl_value_t*)bt_data[i+1];
-                uintptr_t nptr = 0;
-                i += 3;
-                if (gc_try_setmark(new_obj, &nptr, &tag, &bits)) {
-                    stackitr->i = i;
-                    stackitr->itr = itr;
-                    gc_repush_markdata(&sp, gc_mark_excstack_t);
-                    goto mark;
+                // Found a non-native backtrace frame entry: iterate to mark
+                // any GC-managed values inside.
+                size_t ngcvals = JL_BT_NUM_GCVALS(frameheader);
+                while (gcval_index < ngcvals) {
+                    new_obj = bt_data[bt_index + 1 + gcval_index].jlvalue;
+                    uintptr_t nptr = 0;
+                    gcval_index += 1;
+                    if (gc_try_setmark(new_obj, &nptr, &tag, &bits)) {
+                        stackitr->itr = itr;
+                        stackitr->bt_index = bt_index;
+                        stackitr->gcval_index = gcval_index;
+                        gc_repush_markdata(&sp, gc_mark_excstack_t);
+                        goto mark;
+                    }
                 }
             }
-            // mark the exception
+            // The exception comes last - mark it
             new_obj = jl_excstack_exception(excstack, itr);
             itr = jl_excstack_next(excstack, itr);
-            i = 0;
+            bt_index = 0;
+            gcval_index = 0;
             uintptr_t nptr = 0;
             if (gc_try_setmark(new_obj, &nptr, &tag, &bits)) {
-                stackitr->i = i;
                 stackitr->itr = itr;
+                stackitr->bt_index = bt_index;
+                stackitr->gcval_index = gcval_index;
                 gc_repush_markdata(&sp, gc_mark_excstack_t);
                 goto mark;
             }
@@ -2359,7 +2366,7 @@ mark: {
             if (ta->excstack) {
                 gc_setmark_buf_(ptls, ta->excstack, bits, sizeof(jl_excstack_t) +
                                 sizeof(uintptr_t)*ta->excstack->reserved_size);
-                gc_mark_excstack_t stackdata = {ta->excstack, ta->excstack->top, 0};
+                gc_mark_excstack_t stackdata = {ta->excstack, ta->excstack->top, 0, 0};
                 gc_mark_stack_push(&ptls->gc_cache, &sp, gc_mark_laddr(excstack),
                                    &stackdata, sizeof(stackdata), 1);
             }
@@ -2654,13 +2661,15 @@ static void jl_gc_queue_remset(jl_gc_mark_cache_t *gc_cache, jl_gc_mark_sp_t *sp
 
 static void jl_gc_queue_bt_buf(jl_gc_mark_cache_t *gc_cache, jl_gc_mark_sp_t *sp, jl_ptls_t ptls2)
 {
-    size_t n = 0;
-    while (n+2 < ptls2->bt_size) {
-        if (ptls2->bt_data[n] == JL_BT_INTERP_FRAME) {
-            gc_mark_queue_obj(gc_cache, sp, (jl_value_t*)ptls2->bt_data[n+1]);
-            n += 2;
-        }
-        n++;
+    jl_bt_element_t *bt_data = ptls2->bt_data;
+    size_t bt_size = ptls2->bt_size;
+    for (size_t i = 0; i < bt_size; i += JL_BT_ENTRY_SIZE(bt_data[i])) {
+        jl_bt_element_t frameheader = bt_data[i];
+        if (JL_BT_IS_NATIVE(frameheader))
+            continue;
+        size_t ngcvals = JL_BT_NUM_GCVALS(frameheader);
+        for (size_t j = 0; j < ngcvals; j++)
+            gc_mark_queue_obj(gc_cache, sp, bt_data[i+1+j].jlvalue);
     }
 }
 

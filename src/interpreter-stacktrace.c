@@ -390,7 +390,8 @@ JL_DLLEXPORT int jl_is_enter_interpreter_frame(uintptr_t ip)
     return enter_interpreter_frame_start <= ip && ip <= enter_interpreter_frame_end;
 }
 
-JL_DLLEXPORT size_t jl_capture_interp_frame(uintptr_t *data, uintptr_t sp, uintptr_t fp, size_t space_remaining)
+JL_DLLEXPORT size_t jl_capture_interp_frame(jl_bt_element_t *bt_data, uintptr_t sp,
+                                            uintptr_t fp, size_t space_remaining)
 {
 #ifdef FP_CAPTURE_OFFSET
     interpreter_state *s = (interpreter_state *)(fp-FP_CAPTURE_OFFSET);
@@ -399,11 +400,17 @@ JL_DLLEXPORT size_t jl_capture_interp_frame(uintptr_t *data, uintptr_t sp, uintp
 #endif
     if (space_remaining <= 1)
         return 0;
-    // Sentinel value to indicate an interpreter frame
-    data[0] = JL_BT_INTERP_FRAME;
-    data[1] = s->mi ? (uintptr_t)s->mi : s->src ? (uintptr_t)s->src : (uintptr_t)jl_nothing;
-    data[2] = (uintptr_t)s->ip;
-    return 2;
+    int need_module = !s->mi;
+    size_t gcvals = need_module ? 2 : 1;
+    bt_data[0].uintval = JL_BT_PACK_ENTRY_HEADER(1, gcvals, 0, JL_BT_INTERP_FRAME_TAG, s->ip);
+    bt_data[1].jlvalue = s->mi  ? (jl_value_t*)s->mi  :
+                      s->src ? (jl_value_t*)s->src : (jl_value_t*)jl_nothing;
+    if (need_module) {
+        // If we only have a CodeInfo (s->src), we are in a top level thunk and
+        // need to record the module separately.
+        bt_data[2].jlvalue = (jl_value_t*)s->module;
+    }
+    return gcvals;
 }
 
 extern void * CALLBACK_ABI enter_interpreter_frame(void * CALLBACK_ABI (*callback)(interpreter_state *, void *), void *arg);
@@ -418,8 +425,10 @@ JL_DLLEXPORT int jl_is_enter_interpreter_frame(uintptr_t ip)
     return 0;
 }
 
-JL_DLLEXPORT size_t jl_capture_interp_frame(uintptr_t *data, uintptr_t sp, uintptr_t fp, size_t space_remaining)
+JL_DLLEXPORT size_t jl_capture_interp_frame(jl_bt_element_t *bt_data, uintptr_t sp,
+                                            uintptr_t fp, size_t space_remaining)
 {
+    // NB: data[0] already contains the native frame
     return 0;
 }
 #define CALLBACK_ABI

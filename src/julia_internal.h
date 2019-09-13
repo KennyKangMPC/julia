@@ -579,7 +579,72 @@ jl_tupletype_t *arg_type_tuple(jl_value_t *arg1, jl_value_t **args, size_t nargs
 
 int jl_has_meta(jl_array_t *body, jl_sym_t *sym);
 
-// backtraces
+//--------------------------------------------------
+// Backtraces
+
+// Backtrace buffers:
+//
+// A backtrace buffer is an array of instruction pointers ordered from the
+// inner-most frame to the outermost. We store backtrace buffers in a special
+// raw format for two reasons:
+//
+//   * Efficiency: Every `throw()` must populate the trace so it must be as
+//     efficient as possible.
+//   * Signal safety: For signal-based exceptions such as StackOverflowError
+//     the trace buffer needs to be filled from a signal handler where most
+//     operations are not allowed, including allocating memory with malloc().
+//
+// The raw buffer can include two types of instruction pointers:
+//
+//   1. Instruction pointers to native code
+//   2. An "interpreter frame": a pointer to the julia object holding the code
+//      being interpreted and some additional information including the
+//      location within that code.
+//
+// Native instruction pointers are directly harvested during the native stack
+// walk, while interpreter frames need extra code to preserve some of the
+// interpreter state so that the interpreter's code position can be reported to
+// the user.
+
+// Element type for backtrace buffers.
+//
+// Format of jl_bt_element_t tag bits in `uintval`, from LSB to MSB.
+//
+//   offset name         comment
+//   0:0    non_native   flag for non-native frame (native IPs aligned => 0 bit here)
+//   1:2    num_gcvals   Number of GC-managed pointers for this frame entry
+//   3:4    num_uintval  Number of non-GC-managed trailing buffer elements
+//   5:7    tag          Frame type
+//   8:...  data         Frame specific data
+typedef struct _jl_bt_element_t {
+    union {
+        uintptr_t   uintval;   // Frame metadata, including tag bits
+        void*       native_ip; // Native instruction pointer
+        jl_value_t* jlvalue;   // Pointer to GC-managed value
+    };
+} jl_bt_element_t;
+
+// bit unpacking is done manually rather than with a bit field to ensure the
+// non-native frame tag bit is definitely the LSB.
+#define JL_BT_IS_NATIVE(bt_elem)    (!((bt_elem).uintval & 1))
+#define JL_BT_NUM_GCVALS(bt_elem)   (((bt_elem).uintval >> 1) & 0x3)
+#define JL_BT_NUM_UINTVALS(bt_elem) (((bt_elem).uintval >> 3) & 0x3)
+#define JL_BT_ENTRY_TAG(bt_elem)    (((bt_elem).uintval >> 5) & 0x7)
+#define JL_BT_ENTRY_DATA(bt_elem)    ((bt_elem).uintval >> 8)
+
+#define JL_BT_PACK_ENTRY_HEADER(non_native, gcvals, uintval, tag, data) \
+    ((non_native) | (((gcvals) & 0x3) << 1) | (((gcvals) & 0x3) << 3) | \
+     ((tag) & 0x7) | ((data) << 8))
+
+// Number of bt elements in frame
+#define JL_BT_ENTRY_SIZE(bt_elem) \
+    (JL_BT_IS_NATIVE(bt_elem) ? 1 : 1 + JL_BT_NUM_GCVALS(bt_elem) + \
+                                           JL_BT_NUM_UINTVALS(bt_elem))
+
+#define JL_BT_INTERP_FRAME_TAG    1  // An interpreter frame
+#define JL_BT_REPEATED_FRAMES_TAG 2  // Compressed representation of repeated frames
+
+// Function metadata arising from debug info lookup of instruction pointer
 typedef struct {
     char *func_name;
     char *file_name;
@@ -624,17 +689,18 @@ typedef int bt_context_t;
 typedef int bt_cursor_t;
 #endif
 // Special marker in backtrace data for encoding interpreter frames
-#define JL_BT_INTERP_FRAME (((uintptr_t)0)-1)
-size_t rec_backtrace(uintptr_t *data, size_t maxsize) JL_NOTSAFEPOINT;
-size_t rec_backtrace_ctx(uintptr_t *data, size_t maxsize, bt_context_t *ctx) JL_NOTSAFEPOINT;
+size_t rec_backtrace(jl_bt_element_t *bt_data, size_t maxsize) JL_NOTSAFEPOINT;
+size_t rec_backtrace_ctx(jl_bt_element_t *bt_data, size_t maxsize, bt_context_t *ctx) JL_NOTSAFEPOINT;
 #ifdef LIBOSXUNWIND
-size_t rec_backtrace_ctx_dwarf(uintptr_t *data, size_t maxsize, bt_context_t *ctx);
+size_t rec_backtrace_ctx_dwarf(jl_bt_element_t *bt_data, size_t maxsize, bt_context_t *ctx);
 #endif
 JL_DLLEXPORT void jl_get_backtrace(jl_array_t **bt, jl_array_t **bt2);
-void jl_critical_error(int sig, bt_context_t *context, uintptr_t *bt_data, size_t *bt_size);
+void jl_critical_error(int sig, bt_context_t *context, jl_bt_element_t *bt_data, size_t *bt_size);
 JL_DLLEXPORT void jl_raise_debugger(void);
 int jl_getFunctionInfo(jl_frame_t **frames, uintptr_t pointer, int skipC, int noInline) JL_NOTSAFEPOINT;
-JL_DLLEXPORT void jl_gdblookup(uintptr_t ip) JL_NOTSAFEPOINT;
+JL_DLLEXPORT void jl_gdblookup(void* ip) JL_NOTSAFEPOINT;
+void jl_print_native_codeloc(void* ip, int do_offset) JL_NOTSAFEPOINT;
+void jl_print_bt_entry_codeloc(jl_bt_element_t *bt_data) JL_NOTSAFEPOINT;
 // *to is NULL or malloc'd pointer, from is allowed to be NULL
 STATIC_INLINE char *jl_copy_str(char **to, const char *from)
 {
@@ -650,7 +716,8 @@ STATIC_INLINE char *jl_copy_str(char **to, const char *from)
 }
 JL_DLLEXPORT int jl_is_interpreter_frame(uintptr_t ip) JL_NOTSAFEPOINT;
 JL_DLLEXPORT int jl_is_enter_interpreter_frame(uintptr_t ip) JL_NOTSAFEPOINT;
-JL_DLLEXPORT size_t jl_capture_interp_frame(uintptr_t *data, uintptr_t sp, uintptr_t fp, size_t space_remaining) JL_NOTSAFEPOINT;
+JL_DLLEXPORT size_t jl_capture_interp_frame(jl_bt_element_t *bt_data, uintptr_t sp,
+                                            uintptr_t fp, size_t space_remaining) JL_NOTSAFEPOINT;
 
 // Exception stack: a stack of pairs of (exception,raw_backtrace).
 // The stack may be traversed and accessed with the functions below.
@@ -660,25 +727,25 @@ typedef struct _jl_excstack_t {
     // Pack all stack entries into a growable buffer to amortize allocation
     // across repeated exception handling.
     // Layout: [bt_data1... bt_size1 exc1  bt_data2... bt_size2 exc2  ..]
-    // uintptr_t data[]; // Access with jl_excstack_raw
+    // jl_bt_element_t data[]; // Access with jl_excstack_raw
 } jl_excstack_t;
 
-STATIC_INLINE uintptr_t *jl_excstack_raw(jl_excstack_t *stack) JL_NOTSAFEPOINT
+STATIC_INLINE jl_bt_element_t *jl_excstack_raw(jl_excstack_t *stack) JL_NOTSAFEPOINT
 {
-    return (uintptr_t*)(stack + 1);
+    return (jl_bt_element_t*)(stack + 1);
 }
 
 // Exception stack access
 STATIC_INLINE jl_value_t *jl_excstack_exception(jl_excstack_t *stack JL_PROPAGATES_ROOT,
                                                 size_t itr) JL_NOTSAFEPOINT
 {
-    return (jl_value_t*)(jl_excstack_raw(stack)[itr-1]);
+    return jl_excstack_raw(stack)[itr-1].jlvalue;
 }
 STATIC_INLINE size_t jl_excstack_bt_size(jl_excstack_t *stack, size_t itr) JL_NOTSAFEPOINT
 {
-    return jl_excstack_raw(stack)[itr-2];
+    return jl_excstack_raw(stack)[itr-2].uintval;
 }
-STATIC_INLINE uintptr_t *jl_excstack_bt_data(jl_excstack_t *stack, size_t itr) JL_NOTSAFEPOINT
+STATIC_INLINE jl_bt_element_t *jl_excstack_bt_data(jl_excstack_t *stack, size_t itr) JL_NOTSAFEPOINT
 {
     return jl_excstack_raw(stack) + itr-2 - jl_excstack_bt_size(stack, itr);
 }
@@ -692,9 +759,10 @@ void jl_reserve_excstack(jl_excstack_t **stack JL_REQUIRE_ROOTED_SLOT,
                          size_t reserved_size);
 void jl_push_excstack(jl_excstack_t **stack JL_REQUIRE_ROOTED_SLOT JL_ROOTING_ARGUMENT,
                       jl_value_t *exception JL_ROOTED_ARGUMENT,
-                      uintptr_t *bt_data, size_t bt_size);
+                      jl_bt_element_t *bt_data, size_t bt_size);
 void jl_copy_excstack(jl_excstack_t *dest, jl_excstack_t *src) JL_NOTSAFEPOINT;
 
+//--------------------------------------------------
 // timers
 // Returns time in nanosec
 JL_DLLEXPORT uint64_t jl_hrtime(void);
