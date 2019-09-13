@@ -87,12 +87,12 @@ void __sanitizer_finish_switch_fiber(void*, const void**, size_t*);
 static inline void sanitizer_start_switch_fiber(const void* bottom, size_t size) {
     __sanitizer_start_switch_fiber(NULL, bottom, size);
 }
-static inline void sanitizer_finish_switch_fiber() {
+static inline void sanitizer_finish_switch_fiber(void) {
     __sanitizer_finish_switch_fiber(NULL, NULL, NULL);
 }
 #else
 static inline void sanitizer_start_switch_fiber(const void* bottom, size_t size) {}
-static inline void sanitizer_finish_switch_fiber() {}
+static inline void sanitizer_finish_switch_fiber(void) {}
 #endif
 
 #define container_of(ptr, type, member) \
