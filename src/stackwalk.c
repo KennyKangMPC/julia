@@ -579,7 +579,8 @@ void jl_print_bt_entry_codeloc(jl_bt_element_t *bt_data) JL_NOTSAFEPOINT
         }
     }
     else {
-        jl_safe_printf("Unknown backtrace entry");
+        jl_safe_printf("Non-native bt entry with header bits 0x%" PRIxPTR "\n",
+                       bt_data[i].uintval);
     }
 }
 

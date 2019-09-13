@@ -233,7 +233,12 @@ void jl_critical_error(int sig, bt_context_t *context, jl_bt_element_t *bt_data,
     if (context)
         *bt_size = n = rec_backtrace_ctx(bt_data, JL_MAX_BT_SIZE, context);
     for (i = 0; i < n; i += JL_BT_ENTRY_SIZE(bt_data[i])) {
-        jl_print_bt_entry_codeloc(bt_data + i);
+        if (JL_BT_IS_NATIVE(bt_data[i]))
+            jl_print_native_codeloc(bt_data + i, 1);
+        else {
+            jl_safe_printf("Non-native bt entry with header bits 0x%" PRIxPTR "\n",
+                           bt_data[i].uintval);
+        }
     }
     gc_debug_print_status();
     gc_debug_critical_error();

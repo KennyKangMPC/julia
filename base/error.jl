@@ -71,6 +71,7 @@ end
 struct InterpreterIP
     code::Union{CodeInfo,Core.MethodInstance,Nothing}
     stmt::Csize_t
+    mod::Any # FIXME Union{Module,Nothing} ?
 end
 
 # convert dual arrays (ips, interpreter_frames) to a single array of locations
@@ -79,16 +80,24 @@ function _reformat_bt(bt, bt2)
     i, j = 1, 1
     while i <= length(bt)
         ip = bt[i]::Ptr{Cvoid}
-        if ip == Ptr{Cvoid}(-1%UInt)
-            # The next one is really a CodeInfo
-            push!(ret, InterpreterIP(
-                bt2[j],
-                bt[i+2]))
-            j += 1
-            i += 3
-        else
+        header = reinterpret(UInt, ip)
+        if header & 1 == 0 # See JL_BT_IS_NATIVE
+            # native frame
             push!(ret, Ptr{Cvoid}(ip))
             i += 1
+        else
+            # Non-native frame
+            tag = (header >> 5) & 0x7
+            if tag == 1 # JL_BT_INTERP_FRAME_TAG
+                code    = bt2[j]
+                codeloc = header >> 8
+                ngcvals = (header >> 1) & 0x3
+                mod = ngcvals == 2 ? bt2[j+1] : nothing
+                push!(ret, InterpreterIP(code, codeloc, mod))
+                j += ngcvals
+            end
+            # See JL_BT_ENTRY_ENTRY_SIZE
+            i += Int(1 + ((header >> 1) & 0x3) + ((header >> 3) & 0x3))
         end
     end
     ret
