@@ -438,7 +438,7 @@ void JL_NORETURN throw_internal(jl_value_t *exception JL_MAYBE_UNROOTED)
         jl_longjmp(*ptls->safe_restore, 1);
     JL_GC_PUSH1(&exception);
     jl_gc_unsafe_enter(ptls);
-    if (exception) {
+    if (exception && (ptls->bt_size != 0)) {
         // The temporary ptls->bt_data is rooted by special purpose code in the
         // GC. This exists only for the purpose of preserving bt_data until we
         // set ptls->bt_size=0 below.
@@ -492,7 +492,6 @@ JL_DLLEXPORT void jl_sig_throw(void)
 {
     jl_ptls_t ptls = jl_get_ptls_states();
     jl_value_t *e = ptls->sig_exception;
-    assert(e && ptls->bt_size != 0);
     ptls->sig_exception = NULL;
     throw_internal(e);
 }
